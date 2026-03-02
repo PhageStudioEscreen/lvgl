@@ -17,6 +17,7 @@
 #include <libavutil/samplefmt.h>
 #include <libavutil/timestamp.h>
 #include <libswscale/swscale.h>
+#include <string.h>
 
 /*********************
  *      DEFINES
@@ -87,6 +88,8 @@ static int ffmpeg_get_frame_refr_period(struct ffmpeg_context_s * ffmpeg_ctx);
 static uint8_t * ffmpeg_get_image_data(struct ffmpeg_context_s * ffmpeg_ctx);
 static int ffmpeg_update_next_frame(struct ffmpeg_context_s * ffmpeg_ctx);
 static int ffmpeg_output_video_frame(struct ffmpeg_context_s * ffmpeg_ctx);
+static int ffmpeg_decode_packet(AVCodecContext * dec, const AVPacket * pkt, struct ffmpeg_context_s * ffmpeg_ctx);
+static int ffmpeg_seek_to_start(struct ffmpeg_context_s * ffmpeg_ctx);
 static bool ffmpeg_pix_fmt_has_alpha(enum AVPixelFormat pix_fmt);
 static bool ffmpeg_pix_fmt_is_yuv(enum AVPixelFormat pix_fmt);
 
@@ -183,14 +186,25 @@ lv_result_t lv_ffmpeg_player_set_src(lv_obj_t * obj, const char * path)
     int height         = player->ffmpeg_ctx->video_dec_ctx->height;
     uint32_t data_size = 0;
 
-    data_size = width * height * 4;
-
     player->imgdsc.header.w      = width;
     player->imgdsc.header.h      = height;
-    player->imgdsc.data_size     = data_size;
     player->imgdsc.header.cf     = has_alpha ? LV_COLOR_FORMAT_ARGB8888 : LV_COLOR_FORMAT_NATIVE;
     player->imgdsc.header.stride = width * lv_color_format_get_size(player->imgdsc.header.cf);
+    data_size                    = player->imgdsc.header.stride * height;
+    player->imgdsc.data_size     = data_size;
     player->imgdsc.data          = ffmpeg_get_image_data(player->ffmpeg_ctx);
+
+    if(player->ffmpeg_ctx->video_dst_data[0]) {
+        memset(player->ffmpeg_ctx->video_dst_data[0], 0,
+               (size_t)player->ffmpeg_ctx->video_dst_linesize[0] * (size_t)height);
+    }
+
+    if(ffmpeg_seek_to_start(player->ffmpeg_ctx) < 0 || ffmpeg_update_next_frame(player->ffmpeg_ctx) <= 0) {
+        LV_LOG_ERROR("ffmpeg decode first frame failed: %s", path);
+        ffmpeg_close(player->ffmpeg_ctx);
+        player->ffmpeg_ctx = NULL;
+        goto failed;
+    }
 
     lv_image_set_src(&player->img.obj, &(player->imgdsc));
 
@@ -223,12 +237,17 @@ void lv_ffmpeg_player_set_cmd(lv_obj_t * obj, lv_ffmpeg_player_cmd_t cmd)
 
     switch(cmd) {
         case LV_FFMPEG_PLAYER_CMD_START:
-            av_seek_frame(player->ffmpeg_ctx->fmt_ctx, 0, 0, AVSEEK_FLAG_BACKWARD);
+            if(ffmpeg_seek_to_start(player->ffmpeg_ctx) >= 0) {
+                if(ffmpeg_update_next_frame(player->ffmpeg_ctx) > 0) {
+                    lv_image_cache_drop(lv_image_get_src(obj));
+                    lv_obj_invalidate(obj);
+                }
+            }
             lv_timer_resume(timer);
             LV_LOG_INFO("ffmpeg player start");
             break;
         case LV_FFMPEG_PLAYER_CMD_STOP:
-            av_seek_frame(player->ffmpeg_ctx->fmt_ctx, 0, 0, AVSEEK_FLAG_BACKWARD);
+            ffmpeg_seek_to_start(player->ffmpeg_ctx);
             lv_timer_pause(timer);
             LV_LOG_INFO("ffmpeg player stop");
             break;
@@ -442,8 +461,8 @@ static int ffmpeg_output_video_frame(struct ffmpeg_context_s * ffmpeg_ctx)
         int lv_linesize  = lv_color_format_get_size(LV_COLOR_FORMAT_NATIVE) * width;
         int dst_linesize = ffmpeg_ctx->video_dst_linesize[0];
         if(dst_linesize != lv_linesize) {
-            LV_LOG_WARN("ffmpeg linesize = %d, but lvgl image require %d", dst_linesize, lv_linesize);
-            ffmpeg_ctx->video_dst_linesize[0] = lv_linesize;
+            LV_LOG_ERROR("ffmpeg linesize = %d, but lvgl image require %d", dst_linesize, lv_linesize);
+            return -1;
         }
     }
 
@@ -458,6 +477,7 @@ failed:
 static int ffmpeg_decode_packet(AVCodecContext * dec, const AVPacket * pkt, struct ffmpeg_context_s * ffmpeg_ctx)
 {
     int ret = 0;
+    int got_frame = 0;
 
     /* submit the packet to the decoder */
     ret = avcodec_send_packet(dec, pkt);
@@ -476,7 +496,7 @@ static int ffmpeg_decode_packet(AVCodecContext * dec, const AVPacket * pkt, stru
              * but there were no errors during decoding
              */
             if(ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
-                return 0;
+                return got_frame;
             }
 
             LV_LOG_ERROR("Error during decoding (%s)", av_err2str(ret));
@@ -486,6 +506,9 @@ static int ffmpeg_decode_packet(AVCodecContext * dec, const AVPacket * pkt, stru
         /* write the frame data to output file */
         if(dec->codec->type == AVMEDIA_TYPE_VIDEO) {
             ret = ffmpeg_output_video_frame(ffmpeg_ctx);
+            if(ret >= 0) {
+                got_frame = 1;
+            }
         }
 
         av_frame_unref(ffmpeg_ctx->frame);
@@ -495,6 +518,27 @@ static int ffmpeg_decode_packet(AVCodecContext * dec, const AVPacket * pkt, stru
         }
     }
 
+    return got_frame;
+}
+
+static int ffmpeg_seek_to_start(struct ffmpeg_context_s * ffmpeg_ctx)
+{
+    int64_t start_ts = 0;
+
+    if(ffmpeg_ctx == NULL || ffmpeg_ctx->fmt_ctx == NULL || ffmpeg_ctx->video_dec_ctx == NULL) {
+        return -1;
+    }
+
+    if(ffmpeg_ctx->video_stream && ffmpeg_ctx->video_stream->start_time != AV_NOPTS_VALUE) {
+        start_ts = ffmpeg_ctx->video_stream->start_time;
+    }
+
+    if(av_seek_frame(ffmpeg_ctx->fmt_ctx, ffmpeg_ctx->video_stream_idx, start_ts, AVSEEK_FLAG_BACKWARD) < 0) {
+        LV_LOG_WARN("av_seek_frame failed");
+        return -1;
+    }
+
+    avcodec_flush_buffers(ffmpeg_ctx->video_dec_ctx);
     return 0;
 }
 
@@ -622,8 +666,8 @@ static int ffmpeg_update_next_frame(struct ffmpeg_context_s * ffmpeg_ctx)
                 break;
             }
 
-            /* Used to filter data that is not an image */
-            if(is_image) {
+            /* 仅在真正解出至少一帧后才返回 */
+            if(is_image && ret > 0) {
                 break;
             }
         } else {
@@ -705,7 +749,7 @@ static int ffmpeg_image_allocate(struct ffmpeg_context_s * ffmpeg_ctx)
     LV_LOG_INFO("alloc video_src_bufsize = %d", ret);
 
     ret = av_image_alloc(ffmpeg_ctx->video_dst_data, ffmpeg_ctx->video_dst_linesize, ffmpeg_ctx->video_dec_ctx->width,
-                         ffmpeg_ctx->video_dec_ctx->height, ffmpeg_ctx->video_dst_pix_fmt, 4);
+                         ffmpeg_ctx->video_dec_ctx->height, ffmpeg_ctx->video_dst_pix_fmt, 1);
 
     if(ret < 0) {
         LV_LOG_ERROR("Could not allocate dst raw video buffer");
@@ -785,6 +829,10 @@ static void lv_ffmpeg_player_frame_update_cb(lv_timer_t * timer)
             player->event_cb(obj, obj->user_data);
         }
         lv_ffmpeg_player_set_cmd(obj, player->auto_restart ? LV_FFMPEG_PLAYER_CMD_START : LV_FFMPEG_PLAYER_CMD_STOP);
+        return;
+    }
+
+    if(has_next == 0) {
         return;
     }
 
