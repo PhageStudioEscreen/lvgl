@@ -13,7 +13,7 @@
 #include "lv_libjpeg_turbo.h"
 #include <stdio.h>
 #include <jpeglib.h>
-#include <jpegint.h>
+#include "jpegint.h"
 #include <setjmp.h>
 #include "../../core/lv_global.h"
 
