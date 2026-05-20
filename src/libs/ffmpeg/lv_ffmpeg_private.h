@@ -34,6 +34,7 @@ struct lv_ffmpeg_player_t {
     void (*event_cb)(lv_obj_t * obj, void * user_data);
     void * user_data;
     struct ffmpeg_context_s * ffmpeg_ctx;
+    int64_t current_time_ms;
 };
 
 /**********************

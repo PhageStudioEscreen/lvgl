@@ -83,6 +83,14 @@ void lv_ffmpeg_player_set_auto_restart(lv_obj_t * obj, bool en);
 void lv_ffmpeg_player_set_playdone_event(lv_obj_t * obj, void (*event_cb)(lv_obj_t * obj, void * user_data),
                                          void * user_data);
 
+void lv_ffmpeg_player_update_frame(lv_obj_t * obj);
+
+void lv_ffmpeg_player_seek(lv_obj_t * obj, int64_t timestamp_ms);
+int64_t lv_ffmpeg_player_get_pts(lv_obj_t * obj);
+int64_t lv_ffmpeg_player_get_duration(lv_obj_t * obj);
+void lv_ffmpeg_player_pause(lv_obj_t * obj);
+void lv_ffmpeg_player_resume(lv_obj_t * obj);
+
 /*=====================
  * Other functions
  *====================*/
